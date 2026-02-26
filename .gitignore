@@ -1,0 +1,49 @@
+# Build directories
+build/
+out/
+
+# Visual Studio
+.vs/
+*.vcxproj.user
+*.vcxproj.filters
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# vcpkg
+vcpkg_installed/
+.vcpkg-root
+
+CLAUDE.md
+
+# IDE files
+.vscode/
+.cursor/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+
+# Logs
+*.log
+
+# Debug files
+*.pdb
+*.ilk
+
+# Backup files
+*.bak
+*.orig
