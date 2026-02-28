@@ -12,6 +12,7 @@ namespace UnstackQuestItems {
 
     struct Config {
         bool debugLogging = false;
+        bool showZeroWeight = true;
 
         static Config& Get() {
             static Config instance;
@@ -34,6 +35,7 @@ namespace UnstackQuestItems {
             }
 
             debugLogging = ini.GetBoolValue("General", "bDebugLogging", false);
+            showZeroWeight = ini.GetBoolValue("General", "bShowZeroWeight", true);
         }
     };
 
@@ -44,11 +46,15 @@ namespace UnstackQuestItems {
     static std::atomic<uint64_t> g_addToItemListCalls{0};
     static std::atomic<uint64_t> g_splitCalls{0};
 
-    // AddToItemList: internal game function that adds an InventoryEntryData to
-    // the UI item list when the inventory menu is built.
     //   void* AddToItemList(void* itemList, RE::InventoryEntryData* entry, void* param3)
     using AddToItemList_t = void*(*)(void*, RE::InventoryEntryData*, void*);
     static AddToItemList_t g_originalAddToItemList = nullptr;
+
+    using UpdateImpl_t = void(*)(RE::ItemList*, RE::TESObjectREFR*);
+    static UpdateImpl_t g_originalUpdateImpl = nullptr;
+
+    using SetItem_t = void(*)(RE::ItemCard*, const RE::InventoryEntryData*, bool);
+    static SetItem_t g_originalSetItem = nullptr;
 
     // ============================================================
     // QUEST-FLAG DETECTION
@@ -78,8 +84,20 @@ namespace UnstackQuestItems {
         return false;
     }
 
+    static bool HasQuestExtraData(const RE::InventoryEntryData* a_entry) {
+        if (!a_entry || !a_entry->extraLists) {
+            return false;
+        }
+        for (auto* xList : *a_entry->extraLists) {
+            if (IsQuestExtraDataList(xList)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // ============================================================
-    // MENU HANDLER (diagnostics when debug logging is on)
+    // MENU HANDLER 
     // ============================================================
 
     class MenuEventHandler : public RE::BSTEventSink<RE::MenuOpenCloseEvent> {
@@ -171,8 +189,64 @@ namespace UnstackQuestItems {
     }
 
     // ============================================================
+    // ZERO-WEIGHT DISPLAY FOR QUEST ITEMS
+    // ============================================================
+
+    static void HookedUpdateImpl(RE::ItemList* a_list, RE::TESObjectREFR* a_owner) {
+        g_originalUpdateImpl(a_list, a_owner);
+
+        for (auto* item : a_list->items) {
+            if (!item) {
+                continue;
+            }
+            if (HasQuestExtraData(item->data.objDesc)) {
+                RE::GFxValue zero;
+                zero.SetNumber(0.0);
+                item->obj.SetMember("weight", zero);
+            }
+        }
+    }
+
+    static void HookedSetItem(
+        RE::ItemCard* a_card,
+        const RE::InventoryEntryData* a_item,
+        bool a_ignoreStolen
+    ) {
+        g_originalSetItem(a_card, a_item, a_ignoreStolen);
+
+        if (HasQuestExtraData(a_item)) {
+            RE::GFxValue zero;
+            zero.SetNumber(0.0);
+            a_card->obj.SetMember("weight", zero);
+        }
+    }
+
+    // ============================================================
     // INSTALLATION
     // ============================================================
+
+    static void WriteAbsoluteJmp(std::uint8_t* dest, std::uintptr_t target) {
+        dest[0] = 0xFF;
+        dest[1] = 0x25;
+        dest[2] = 0x00;
+        dest[3] = 0x00;
+        dest[4] = 0x00;
+        dest[5] = 0x00;
+        std::memcpy(dest + 6, &target, 8);
+    }
+
+    static void WriteRelativeJmp(std::uintptr_t targetAddr, std::uintptr_t stubAddr, size_t prologueSize) {
+        std::int32_t relOffset = static_cast<std::int32_t>(stubAddr - targetAddr - 5);
+
+        std::vector<std::uint8_t> patch(prologueSize, 0x90);
+        patch[0] = 0xE9;
+        patch[1] = static_cast<std::uint8_t>(relOffset);
+        patch[2] = static_cast<std::uint8_t>(relOffset >> 8);
+        patch[3] = static_cast<std::uint8_t>(relOffset >> 16);
+        patch[4] = static_cast<std::uint8_t>(relOffset >> 24);
+
+        REL::safe_write(targetAddr, patch.data(), patch.size());
+    }
 
     static void* CreateManualHook(
         std::uintptr_t targetAddr,
@@ -182,47 +256,40 @@ namespace UnstackQuestItems {
         auto& trampoline = SKSE::GetTrampoline();
         auto* bytes = reinterpret_cast<std::uint8_t*>(targetAddr);
 
+        if (bytes[0] == 0xE9 && prologueSize >= 5) {
+            std::int32_t rel32;
+            std::memcpy(&rel32, bytes + 1, 4);
+            std::uintptr_t prevTarget = targetAddr + 5 + rel32;
+
+            SKSE::log::info("  existing hook detected — chaining (prev target: 0x{:X})", prevTarget);
+
+            auto* trampolineCode = trampoline.allocate(14);
+            WriteAbsoluteJmp(reinterpret_cast<std::uint8_t*>(trampolineCode), prevTarget);
+
+            auto* jumpStub = trampoline.allocate(14);
+            WriteAbsoluteJmp(
+                reinterpret_cast<std::uint8_t*>(jumpStub),
+                reinterpret_cast<std::uintptr_t>(hookFunc));
+
+            WriteRelativeJmp(targetAddr, reinterpret_cast<std::uintptr_t>(jumpStub), prologueSize);
+            return trampolineCode;
+        }
+
         auto* trampolineCode = trampoline.allocate(32);
 
         std::memcpy(trampolineCode, bytes, prologueSize);
 
         std::uintptr_t returnAddr = targetAddr + prologueSize;
-        std::uint8_t* jumpBack = reinterpret_cast<std::uint8_t*>(trampolineCode) + prologueSize;
-        jumpBack[0] = 0xFF;  // JMP [rip+0]
-        jumpBack[1] = 0x25;
-        jumpBack[2] = 0x00;
-        jumpBack[3] = 0x00;
-        jumpBack[4] = 0x00;
-        jumpBack[5] = 0x00;
-        std::memcpy(jumpBack + 6, &returnAddr, 8);
+        WriteAbsoluteJmp(
+            reinterpret_cast<std::uint8_t*>(trampolineCode) + prologueSize,
+            returnAddr);
 
         auto* jumpStub = trampoline.allocate(14);
-        auto hookAddr = reinterpret_cast<std::uintptr_t>(hookFunc);
+        WriteAbsoluteJmp(
+            reinterpret_cast<std::uint8_t*>(jumpStub),
+            reinterpret_cast<std::uintptr_t>(hookFunc));
 
-        std::uint8_t* stubBytes = reinterpret_cast<std::uint8_t*>(jumpStub);
-        stubBytes[0] = 0xFF;
-        stubBytes[1] = 0x25;
-        stubBytes[2] = 0x00;
-        stubBytes[3] = 0x00;
-        stubBytes[4] = 0x00;
-        stubBytes[5] = 0x00;
-        std::memcpy(stubBytes + 6, &hookAddr, 8);
-
-        auto stubAddr = reinterpret_cast<std::uintptr_t>(jumpStub);
-        std::int32_t relOffset = static_cast<std::int32_t>(stubAddr - targetAddr - 5);
-
-        std::vector<std::uint8_t> patchBytes(prologueSize);
-        patchBytes[0] = 0xE9;
-        patchBytes[1] = static_cast<std::uint8_t>(relOffset);
-        patchBytes[2] = static_cast<std::uint8_t>(relOffset >> 8);
-        patchBytes[3] = static_cast<std::uint8_t>(relOffset >> 16);
-        patchBytes[4] = static_cast<std::uint8_t>(relOffset >> 24);
-        for (size_t i = 5; i < prologueSize; ++i) {
-            patchBytes[i] = 0x90;  // NOP
-        }
-
-        REL::safe_write(targetAddr, patchBytes.data(), patchBytes.size());
-
+        WriteRelativeJmp(targetAddr, reinterpret_cast<std::uintptr_t>(jumpStub), prologueSize);
         return trampolineCode;
     }
 
@@ -267,6 +334,24 @@ namespace UnstackQuestItems {
             );
 
             SKSE::log::info("AddToItemList hooked at base+0x{:X}", offset);
+        }
+
+        if (Config::Get().showZeroWeight) {
+            // Prologue: 40 57 / 48 83 EC 30  (PUSH RDI; SUB RSP,0x30) = 6 bytes
+            REL::Relocation<std::uintptr_t> updateImplAddr{ RELOCATION_ID(50099, 51031) };
+            g_originalUpdateImpl = reinterpret_cast<UpdateImpl_t>(
+                CreateManualHook(updateImplAddr.address(), reinterpret_cast<void*>(&HookedUpdateImpl), 6)
+            );
+            SKSE::log::info("ItemList::Update_Impl hooked for zero-weight display");
+
+            // Prologue: 48 8B C4 / 44 88 40 18  (MOV RAX,RSP; MOV [RAX+18],R8B) = 7 bytes
+            REL::Relocation<std::uintptr_t> setItemAddr{ RELOCATION_ID(51019, 51897) };
+            g_originalSetItem = reinterpret_cast<SetItem_t>(
+                CreateManualHook(setItemAddr.address(), reinterpret_cast<void*>(&HookedSetItem), 7)
+            );
+            SKSE::log::info("ItemCard::SetItem hooked for zero-weight display");
+        } else {
+            SKSE::log::info("Zero-weight display for quest items disabled");
         }
 
         if (Config::Get().debugLogging) {
