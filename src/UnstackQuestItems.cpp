@@ -12,7 +12,7 @@ namespace UnstackQuestItems {
 
     struct Config {
         bool debugLogging = false;
-        bool showZeroWeight = true;
+
 
         static Config& Get() {
             static Config instance;
@@ -35,7 +35,7 @@ namespace UnstackQuestItems {
             }
 
             debugLogging = ini.GetBoolValue("General", "bDebugLogging", false);
-            showZeroWeight = ini.GetBoolValue("General", "bShowZeroWeight", true);
+
         }
     };
 
@@ -50,11 +50,29 @@ namespace UnstackQuestItems {
     using AddToItemList_t = void*(*)(void*, RE::InventoryEntryData*, void*);
     static AddToItemList_t g_originalAddToItemList = nullptr;
 
-    using UpdateImpl_t = void(*)(RE::ItemList*, RE::TESObjectREFR*);
-    static UpdateImpl_t g_originalUpdateImpl = nullptr;
 
-    using SetItem_t = void(*)(RE::ItemCard*, const RE::InventoryEntryData*, bool);
-    static SetItem_t g_originalSetItem = nullptr;
+    // ============================================================
+    // FORM-TYPE CHECK
+    // ============================================================
+
+    static bool IsPhysicalItem(RE::TESBoundObject* obj) {
+        if (!obj) return false;
+        return obj->Is(
+            RE::FormType::Scroll,
+            RE::FormType::Armor,
+            RE::FormType::Book,
+            RE::FormType::Ingredient,
+            RE::FormType::Light,
+            RE::FormType::Misc,
+            RE::FormType::Apparatus,
+            RE::FormType::Weapon,
+            RE::FormType::Ammo,
+            RE::FormType::KeyMaster,
+            RE::FormType::AlchemyItem,
+            RE::FormType::Note,
+            RE::FormType::SoulGem
+        );
+    }
 
     // ============================================================
     // QUEST-FLAG DETECTION
@@ -81,18 +99,6 @@ namespace UnstackQuestItems {
             }
         }
 
-        return false;
-    }
-
-    static bool HasQuestExtraData(const RE::InventoryEntryData* a_entry) {
-        if (!a_entry || !a_entry->extraLists) {
-            return false;
-        }
-        for (auto* xList : *a_entry->extraLists) {
-            if (IsQuestExtraDataList(xList)) {
-                return true;
-            }
-        }
         return false;
     }
 
@@ -137,6 +143,10 @@ namespace UnstackQuestItems {
                 return g_originalAddToItemList(a_itemList, a_entry, a_param3);
             }
             return nullptr;
+        }
+
+        if (!a_entry->object || !IsPhysicalItem(a_entry->object)) {
+            return g_originalAddToItemList(a_itemList, a_entry, a_param3);
         }
 
         std::int32_t questCount = 0;
@@ -186,39 +196,6 @@ namespace UnstackQuestItems {
         }
 
         return g_originalAddToItemList(a_itemList, a_entry, a_param3);
-    }
-
-    // ============================================================
-    // ZERO-WEIGHT DISPLAY FOR QUEST ITEMS
-    // ============================================================
-
-    static void HookedUpdateImpl(RE::ItemList* a_list, RE::TESObjectREFR* a_owner) {
-        g_originalUpdateImpl(a_list, a_owner);
-
-        for (auto* item : a_list->items) {
-            if (!item) {
-                continue;
-            }
-            if (HasQuestExtraData(item->data.objDesc)) {
-                RE::GFxValue zero;
-                zero.SetNumber(0.0);
-                item->obj.SetMember("weight", zero);
-            }
-        }
-    }
-
-    static void HookedSetItem(
-        RE::ItemCard* a_card,
-        const RE::InventoryEntryData* a_item,
-        bool a_ignoreStolen
-    ) {
-        g_originalSetItem(a_card, a_item, a_ignoreStolen);
-
-        if (HasQuestExtraData(a_item)) {
-            RE::GFxValue zero;
-            zero.SetNumber(0.0);
-            a_card->obj.SetMember("weight", zero);
-        }
     }
 
     // ============================================================
@@ -334,24 +311,6 @@ namespace UnstackQuestItems {
             );
 
             SKSE::log::info("AddToItemList hooked at base+0x{:X}", offset);
-        }
-
-        if (Config::Get().showZeroWeight) {
-            // Prologue: 40 57 / 48 83 EC 30  (PUSH RDI; SUB RSP,0x30) = 6 bytes
-            REL::Relocation<std::uintptr_t> updateImplAddr{ RELOCATION_ID(50099, 51031) };
-            g_originalUpdateImpl = reinterpret_cast<UpdateImpl_t>(
-                CreateManualHook(updateImplAddr.address(), reinterpret_cast<void*>(&HookedUpdateImpl), 6)
-            );
-            SKSE::log::info("ItemList::Update_Impl hooked for zero-weight display");
-
-            // Prologue: 48 8B C4 / 44 88 40 18  (MOV RAX,RSP; MOV [RAX+18],R8B) = 7 bytes
-            REL::Relocation<std::uintptr_t> setItemAddr{ RELOCATION_ID(51019, 51897) };
-            g_originalSetItem = reinterpret_cast<SetItem_t>(
-                CreateManualHook(setItemAddr.address(), reinterpret_cast<void*>(&HookedSetItem), 7)
-            );
-            SKSE::log::info("ItemCard::SetItem hooked for zero-weight display");
-        } else {
-            SKSE::log::info("Zero-weight display for quest items disabled");
         }
 
         if (Config::Get().debugLogging) {
